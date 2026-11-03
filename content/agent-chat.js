@@ -1590,7 +1590,7 @@ class ZacSession {
     this.emit("reset");
   }
 
-  async saveNote(turn) {
+  async saveNote(turn, answerHtml = null) {
     const esc = (s) => Zotero.Utilities.htmlSpecialChars(String(s || ""));
     const paras = (s) =>
       String(s || "")
@@ -1600,7 +1600,7 @@ class ZacSession {
     let html = `<h2>${esc("Agent 问答：" + zacClip(turn.question, 40))}</h2>`;
     if (turn.quote) html += `<blockquote>${paras(turn.quote)}</blockquote>`;
     html += `<p><strong>问：</strong>${esc(turn.question)}</p>`;
-    html += `<p><strong>答（${esc(turn.label)}）：</strong></p>` + zacNoteHtml(turn.answer, esc);
+    html += `<p><strong>答（${esc(turn.label)}）：</strong></p>` + (answerHtml || zacNoteHtml(turn.answer, esc));
 
     const note = new Zotero.Item("note");
     note.libraryID = turn.libraryID || Zotero.Libraries.userLibraryID;
@@ -3055,7 +3055,7 @@ class ZacChatView {
         onclick: async () => {
           noteBtn.disabled = true;
           try {
-            await this.s.saveNote(m.turn);
+            await this.s.saveNote(m.turn, this.markdownToNoteHtml(m.text));
             noteBtn.replaceChildren(this.icon("check"), "已存为笔记");
           } catch (e) {
             Zotero.logError(e);
@@ -3241,6 +3241,68 @@ class ZacChatView {
       last = m.index + m[0].length;
     }
     if (last < text.length) parent.append(text.slice(last));
+  }
+
+  // 存为笔记：复用界面的 Markdown 解析结果，转成 Zotero 笔记编辑器支持的 HTML
+  // （标题、段落、粗体/斜体/行内代码、有序/无序列表、引用、代码块、表格、公式）
+  markdownToNoteHtml(text) {
+    const esc = (x) => Zotero.Utilities.htmlSpecialChars(String(x == null ? "" : x));
+    const box = this.el("div");
+    this.renderMarkdown(box, text);
+    const inline = (node) => {
+      let h = "";
+      for (const n of node.childNodes) {
+        if (n.nodeType === 3) {
+          h += esc(n.nodeValue).replace(/\n/g, "<br/>");
+          continue;
+        }
+        if (n.nodeType !== 1) continue;
+        const cl = n.classList;
+        if (cl && cl.contains("zac-math")) h += `<span class="math">$${esc(n.getAttribute("data-tex"))}$</span>`;
+        else if (cl && cl.contains("zac-li-mark")) continue;
+        else if (n.localName === "strong") h += `<strong>${inline(n)}</strong>`;
+        else if (n.localName === "em") h += `<em>${inline(n)}</em>`;
+        else if (n.localName === "code") h += `<code>${esc(n.textContent)}</code>`;
+        else h += inline(n);
+      }
+      return h;
+    };
+    const out = [];
+    let list = null; // { tag, items }
+    const closeList = () => {
+      if (list) out.push(`<${list.tag}>${list.items.map((x) => `<li>${x}</li>`).join("")}</${list.tag}>`);
+      list = null;
+    };
+    for (const n of box.children) {
+      const cl = n.classList;
+      if (cl.contains("zac-li")) {
+        const mark = n.querySelector(".zac-li-mark");
+        const tag = mark && /\d/.test(mark.textContent) ? "ol" : "ul";
+        if (!list || list.tag !== tag) {
+          closeList();
+          list = { tag, items: [] };
+        }
+        list.items.push(inline(n));
+        continue;
+      }
+      closeList();
+      if (n.localName === "p") out.push(`<p>${inline(n)}</p>`);
+      else if (cl.contains("zac-math-display")) {
+        const m = n.querySelector(".zac-math");
+        out.push(m && m.hasAttribute("data-tex") ? `<pre class="math">$$${esc(m.getAttribute("data-tex"))}$$</pre>` : `<p>${inline(n)}</p>`);
+      } else if (cl.contains("zac-h")) out.push(`<h3>${inline(n)}</h3>`);
+      else if (n.localName === "blockquote") out.push(`<blockquote><p>${inline(n)}</p></blockquote>`);
+      else if (n.localName === "hr") out.push("<hr/>");
+      else if (cl.contains("zac-codeblock")) out.push(`<pre>${esc((n.querySelector("code") || n).textContent)}</pre>`);
+      else if (cl.contains("zac-table-wrap")) {
+        const rows = [...n.querySelectorAll("tr")].map(
+          (tr) => `<tr>${[...tr.children].map((c) => `<${c.localName}>${inline(c)}</${c.localName}>`).join("")}</tr>`
+        );
+        out.push(`<table>${rows.join("")}</table>`);
+      } else out.push(`<p>${inline(n)}</p>`);
+    }
+    closeList();
+    return out.join("");
   }
 
   // LaTeX → MathML（KaTeX 只做转换，排版交给 Zotero 自带的 MathML 引擎）；失败时原样显示
