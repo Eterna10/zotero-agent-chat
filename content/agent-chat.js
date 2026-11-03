@@ -2262,9 +2262,9 @@ const ZAC_CSS = `
 .zac-num-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .zac-num-row input[type=number] { margin-top: 0 !important; }
 .zac-unit { font-size: calc(12px * var(--zac-fs, 1)); color: var(--zac-fg2); }
-.zac-switch { display: flex; gap: 10px; align-items: center; cursor: pointer; }
+.zac-switch { position: relative; display: flex; gap: 10px; align-items: center; cursor: pointer; }
 .zac-switch-text { flex: 1; min-width: 0; }
-.zac-switch-input { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.zac-switch-input { position: absolute; right: 0; top: 50%; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
 .zac-track { position: relative; flex: none; width: calc(32px * var(--zac-fs, 1)); height: calc(19px * var(--zac-fs, 1)); border-radius: 10px; background: var(--zac-soft);
   border: 1px solid var(--zac-line); transition: background .15s; }
 .zac-track::before { content: ""; position: absolute; top: 1px; left: 1px; width: calc(15px * var(--zac-fs, 1)); height: calc(15px * var(--zac-fs, 1)); border-radius: 50%;
@@ -2484,6 +2484,14 @@ class ZacChatView {
       this.settingsPage,
       this.usagePop
     );
+    // 外层容器不应滚动（overflow: hidden 仍可能被焦点滚动带偏），一旦发生立即复位
+    this.root.addEventListener("scroll", () => {
+      if (this.root.scrollTop || this.root.scrollLeft) {
+        this.root.scrollTop = 0;
+        this.root.scrollLeft = 0;
+      }
+    });
+
     // 自绘提示：悬停在带 data-tip 的元素上 0.4 秒后显示
     this.tipEl = this.el("div", { class: "zac-tip" });
     this.root.append(this.tipEl);
