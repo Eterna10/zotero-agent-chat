@@ -309,6 +309,13 @@ var AgentChat = {
     return v;
   },
 
+  // 公式增强：选中公式时截图交给 agent，并让它先还原出准确的 LaTeX
+  formulaEnhance() {
+    const v = this.getPref("formulaEnhance");
+    if (v === undefined || v === null) return this.getPref("autoSnipFormula") !== false;
+    return v !== false;
+  },
+
   floatingEnabled() {
     return this.getPref("floatingEnabled") !== false;
   },
@@ -1559,7 +1566,7 @@ class ZacSession {
     });
     this.emit("quote");
     this.emit("context");
-    if (sel.formula && sel.position && sel._reader && this.p.getPref("autoSnipFormula") !== false) this.snip(sel);
+    if (sel.formula && sel.position && sel._reader && this.p.formulaEnhance()) this.snip(sel);
   }
 
   async snip(sel) {
@@ -1682,7 +1689,7 @@ class ZacSession {
         `【选区截图】${sel.image.path}\n上面的文字来自 PDF 文本层，公式、上下标和特殊符号可能错乱或丢失，请先查看这张截图，以截图内容为准。`
       );
     }
-    if (sel && (sel.formula || sel.image)) {
+    if (sel && sel.enhance && (sel.formula || sel.image)) {
       parts.push(
         "【输出要求】请在回答的最开头，把选中内容准确还原后放在 <restored> 和 </restored> 之间：" +
           "数学公式用 LaTeX（行内 $...$，独立公式 $$...$$），保留公式编号；只还原原文，不要解释。然后另起一段回答问题。"
@@ -1710,7 +1717,8 @@ class ZacSession {
           pageLabel: cur.pageLabel,
           sortIndex: cur.sortIndex,
           formula: cur.formula,
-          image: cur.useImage ? cur.image : null,
+          enhance: this.p.formulaEnhance(),
+          image: cur.useImage && this.p.formulaEnhance() ? cur.image : null,
         }
       : null;
     this.quote = "";
@@ -2938,7 +2946,16 @@ class ZacChatView {
       ...group(
         "对话",
         toggle("includePdfPath", "允许 agent 读取论文全文", "把 PDF 路径告诉 agent，回答可以结合全文").row,
-        toggle("autoSnipFormula", "选中公式时自动截图", "PDF 里的公式复制出来常常是乱码，截图交给 agent 识别，并让它还原出准确的 LaTeX").row,
+        (() => {
+          const t = toggle(
+            "formulaEnhance",
+            "公式增强",
+            "选中公式时自动截取选区图片交给 agent 识别，并让它先还原出准确的 LaTeX，再回答问题；笔记里也会保存还原后的公式和原始截图。" +
+              "开启后，涉及公式的提问会增加模型响应时间（agent 需要额外查看图片并输出还原内容）。"
+          );
+          t.cb.checked = this.p.formulaEnhance();
+          return t.row;
+        })(),
         toggle("noteHighlight", "存为笔记时在原文创建高亮", "笔记里的「跳转到原文」会直接定位到这处高亮；关闭则只跳到对应页").row,
         field("historyTurns", "附带的历史轮数", "每次提问附带最近几轮问答，0 表示不附带", "number"),
         field("timeoutSec", "超时", "超过这个时间自动停止", "number"),
@@ -3284,17 +3301,18 @@ class ZacChatView {
       this.quoteText.title = zacClip(q, 2000);
     }
     const sel = this.s.selection && this.s.selection.text === q ? this.s.selection : null;
-    const showImg = !!(sel && sel.image && sel.useImage);
+    const enh = this.p.formulaEnhance();
+    const showImg = !!(enh && sel && sel.image && sel.useImage);
     this.quoteImg.style.display = showImg ? "block" : "none";
     if (showImg && this.quoteImg.getAttribute("src") !== sel.image.dataURL) this.quoteImg.setAttribute("src", sel.image.dataURL);
-    const canSnip = !!(sel && sel.position && sel._reader);
+    const canSnip = !!(enh && sel && sel.position && sel._reader);
     this.snipBtn.style.display = canSnip ? "" : "none";
     this.snipBtn.classList.toggle("zac-active", showImg);
     const meta = [];
     if (sel && sel.pageLabel) meta.push(`第 ${sel.pageLabel} 页`);
     if (sel && sel.snipping) meta.push("正在截图…");
     else if (showImg) meta.push("已附截图，agent 会对照截图识别公式");
-    else if (sel && sel.formula) meta.push(sel.snipFailed ? "检测到公式，但截图失败" : "检测到公式");
+    else if (sel && sel.formula) meta.push(!enh ? "检测到公式（公式增强已关闭）" : sel.snipFailed ? "检测到公式，但截图失败" : "检测到公式");
     this.quoteMeta.textContent = meta.join(" · ");
     this.quoteMeta.style.display = meta.length ? "" : "none";
     this.updateSendState();
