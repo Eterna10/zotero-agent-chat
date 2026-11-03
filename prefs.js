@@ -21,3 +21,4 @@ pref("extensions.zotero-agent-chat.autoUpdateRestored", false);
 pref("extensions.zotero-agent-chat.autoSnipFormula", true);
 pref("extensions.zotero-agent-chat.noteHighlight", true);
 pref("extensions.zotero-agent-chat.highlightColor", "#a28ae5");
+pref("extensions.zotero-agent-chat.fontScale", 100);
