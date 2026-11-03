@@ -118,6 +118,20 @@ function zacNoteHtml(text, esc) {
   return out.join("");
 }
 
+// 选中的文字是否像公式（PDF 文本层里的公式会变成乱序的字符，需要截图辅助识别）
+function zacLooksLikeFormula(text) {
+  const t = String(text || "");
+  if (!t.trim()) return false;
+  const greek = (t.match(/[Ͱ-Ͽᴀ-ᶿ]/g) || []).length;
+  const ops = (t.match(/[=≠≈≤≥<>±×÷∑∏∫∮√∞∂∇∈∉⊂⊆⊃∪∩∀∃→←↔⇒⇔⟨⟩‖|^_]/g) || []).length;
+  const accents = (t.match(/[̀-ͯˆ˜¯ˇ˙¨′″]/g) || []).length;
+  const mathAlnum = (t.match(/[\u{1D400}-\u{1D7FF}]/gu) || []).length; // 数学字母（𝑥、𝜙 等）
+  const eqNo = /\(\s*\d{1,3}[a-z]?\s*\)\s*[,.]?\s*$/m.test(t) ? 2 : 0; // 行尾的公式编号 "(13)"
+  const shortTokens = (t.match(/(?:^|\s)[A-Za-z](?=\s|$)/g) || []).length; // 散落的单个字母（上下标被拆开）
+  const score = greek * 2 + ops * 1.5 + accents * 2 + mathAlnum * 2 + eqNo + (shortTokens >= 3 ? 2 : 0);
+  return score >= 4 && score / Math.max(t.length, 1) > 0.025;
+}
+
 // 时间：ISO 字符串、Unix 秒或毫秒 → 毫秒
 function zacParseTime(v) {
   if (v == null || v === "") return 0;
@@ -317,6 +331,7 @@ var AgentChat = {
       },
     });
     this.restoreAutoUpdateOnce();
+    this.cleanupSnips();
     this.log("started " + this.version);
   },
 
@@ -388,7 +403,9 @@ var AgentChat = {
     const text = ((params && ((params.annotation && params.annotation.text) || params.text)) || "").trim();
     if (!text) return;
     const session = this.getSession(this.readerWindow(reader));
-    session.setSelection(text, reader.itemID);
+    let ann = null;
+    try { ann = JSON.parse(JSON.stringify(params.annotation)); } catch (e) {}
+    session.setSelection(text, reader.itemID, { annotation: ann, reader });
 
     const btn = doc.createElement("button");
     btn.textContent = "💬 问 Agent";
@@ -436,7 +453,7 @@ var AgentChat = {
 
   /* ---------------- 调用 agent CLI ---------------- */
 
-  buildCommand(agent, { pdfDir = null, prompt = "", model = "", effort = "" } = {}) {
+  buildCommand(agent, { pdfDir = null, prompt = "", model = "", effort = "", images = [] } = {}) {
     const g = (k) => String(this.getPref(k) ?? "").trim();
     if (agent === "claude") {
       const args = ["-p"]; // 非交互模式，prompt 从 stdin 读入
@@ -450,6 +467,7 @@ var AgentChat = {
       const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only"];
       if (model) args.push("-m", model);
       if (effort) args.push("-c", `model_reasoning_effort=${effort}`); // minimal ~ xhigh，取决于模型
+      for (const img of images) args.push("-i", img); // 选区截图直接作为图片输入
       args.push("-");
       return { command: g("codexPath") || "codex", args, stdin: prompt };
     }
@@ -457,7 +475,9 @@ var AgentChat = {
     if (!command) throw new Error("请先在设置（⚙）中填写自定义命令");
     let args = zacSplitArgs(g("customArgs"));
     const promptAsArg = args.some((a) => a.includes("{prompt}"));
-    args = args.map((a) => a.replace(/\{prompt\}/g, () => prompt).replace(/\{pdf_dir\}/g, () => pdfDir || ""));
+    args = args.map((a) =>
+      a.replace(/\{prompt\}/g, () => prompt).replace(/\{pdf_dir\}/g, () => pdfDir || "").replace(/\{image\}/g, () => images[0] || "")
+    );
     return { command, args, stdin: promptAsArg ? "" : prompt };
   },
 
@@ -1023,6 +1043,134 @@ var AgentChat = {
     return p;
   },
 
+  /* ---------------- 选区截图、原文高亮、跳转链接 ---------------- */
+
+  snipDir() {
+    return Zotero.DataDirectory.dir + (Zotero.isWin ? "\\" : "/") + "agent-chat" + (Zotero.isWin ? "\\" : "/") + "snips";
+  },
+
+  // 把选区在阅读器里已经渲染好的页面画面裁下来（PDF 才有；EPUB / 网页快照返回 null）
+  async captureSelection(reader, sel) {
+    const pos = sel && sel.position;
+    if (!pos || !Number.isInteger(pos.pageIndex) || !Array.isArray(pos.rects) || !pos.rects.length) return null;
+    const waive = (o) => (o && o.wrappedJSObject) || o;
+    const internal = waive(reader && reader._internalReader);
+    const view = waive(internal && internal._primaryView);
+    const vwin = waive(view && view._iframeWindow);
+    const app = waive(vwin && vwin.PDFViewerApplication);
+    const viewer = waive(app && app.pdfViewer);
+    if (!viewer || typeof viewer.getPageView !== "function") return null;
+    const pv = waive(viewer.getPageView(pos.pageIndex));
+    if (!pv) return null;
+    const vp = waive(pv.viewport);
+    let canvas = waive(pv.canvas);
+    if (!canvas && pv.div) canvas = waive(pv.div.querySelector("canvas"));
+    if (!vp || !canvas || !canvas.width) return null;
+
+    // PDF 坐标 → 视口坐标（自己按 viewport.transform 计算，避免向页面脚本传对象）
+    const T = Array.from(vp.transform);
+    const toVp = (x, y) => [T[0] * x + T[2] * y + T[4], T[1] * x + T[3] * y + T[5]];
+    let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (const r of pos.rects) {
+      for (const [px, py] of [[r[0], r[1]], [r[2], r[3]], [r[0], r[3]], [r[2], r[1]]]) {
+        const [vx, vy] = toVp(px, py);
+        x1 = Math.min(x1, vx); y1 = Math.min(y1, vy); x2 = Math.max(x2, vx); y2 = Math.max(y2, vy);
+      }
+    }
+    const pad = 6 * (vp.scale || 1);
+    x1 = Math.max(0, x1 - pad); y1 = Math.max(0, y1 - pad);
+    x2 = Math.min(vp.width, x2 + pad); y2 = Math.min(vp.height, y2 + pad);
+    const cssW = x2 - x1, cssH = y2 - y1;
+    if (cssW < 4 || cssH < 4) return null;
+    const sx = canvas.width / vp.width, sy = canvas.height / vp.height;
+    const outW = Math.round(cssW * sx), outH = Math.round(cssH * sy);
+    if (outW * outH > 16e6) return null;
+
+    const win = Zotero.getMainWindow();
+    const out = win.document.createElementNS(ZAC_NS, "canvas");
+    out.width = outW;
+    out.height = outH;
+    const ctx = out.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, outW, outH);
+    ctx.drawImage(canvas, x1 * sx, y1 * sy, cssW * sx, cssH * sy, 0, 0, outW, outH);
+    const dataURL = out.toDataURL("image/png");
+
+    const dir = this.snipDir();
+    await Zotero.File.createDirectoryIfMissingAsync(dir);
+    const path = dir + (Zotero.isWin ? "\\" : "/") + `sel-${Date.now()}.png`;
+    await win.IOUtils.write(path, this.dataURLBytes(dataURL));
+    // 笔记里按 PDF 的原始大小显示（视口尺寸 ÷ 缩放比例）
+    const zoom = vp.scale || 1;
+    return { path, dataURL, width: outW, height: outH, cssWidth: Math.round(cssW / zoom * 1.3333), cssHeight: Math.round(cssH / zoom * 1.3333) };
+  },
+
+  dataURLBytes(dataURL) {
+    const win = Zotero.getMainWindow();
+    const bin = win.atob(String(dataURL).split(",")[1] || "");
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  },
+
+  // 清理 7 天前的截图
+  async cleanupSnips() {
+    try {
+      const IOUtils = Zotero.getMainWindow().IOUtils;
+      const dir = this.snipDir();
+      if (!(await IOUtils.exists(dir))) return;
+      const cutoff = Date.now() - 7 * 86400 * 1000;
+      for (const f of await IOUtils.getChildren(dir)) {
+        try {
+          const st = await IOUtils.stat(f);
+          if (st.lastModified < cutoff) await IOUtils.remove(f);
+        } catch (e) {}
+      }
+    } catch (e) {
+      this.log("cleanupSnips: " + e);
+    }
+  },
+
+  // 在原文选区位置建一个高亮注释，笔记里的链接可以精确跳回这里
+  async createHighlight(attachment, sel) {
+    try {
+      const pos = sel.position;
+      const top = Math.max(...pos.rects.map((r) => r[3]));
+      const left = Math.min(...pos.rects.map((r) => r[0]));
+      const sortIndex =
+        sel.sortIndex ||
+        `${String(pos.pageIndex).padStart(5, "0")}|${String(0).padStart(6, "0")}|${String(Math.max(0, Math.round(10000 - top))).padStart(5, "0")}`;
+      const json = {
+        key: Zotero.DataObjectUtilities.generateKey(),
+        type: "highlight",
+        color: this.getPref("highlightColor") || "#a28ae5",
+        text: sel.text,
+        comment: "Agent 问答",
+        pageLabel: sel.pageLabel || String(pos.pageIndex + 1),
+        sortIndex,
+        position: { pageIndex: pos.pageIndex, rects: pos.rects },
+        tags: [],
+      };
+      void left;
+      await Zotero.Annotations.saveFromJSON(attachment, json);
+      return json.key;
+    } catch (e) {
+      this.log("createHighlight failed: " + e);
+      return null;
+    }
+  },
+
+  openPdfURI(attachment, pageIndex, annotationKey) {
+    let prefix = "library";
+    try {
+      const lib = Zotero.Libraries.get(attachment.libraryID);
+      if (lib && lib.libraryType === "group") prefix = `groups/${Zotero.Groups.getGroupIDFromLibraryID(attachment.libraryID)}`;
+    } catch (e) {}
+    let u = `zotero://open-pdf/${prefix}/items/${attachment.key}?page=${pageIndex + 1}`;
+    if (annotationKey) u += `&annotation=${annotationKey}`;
+    return u;
+  },
+
   /* ---------------- 一键安装与登录 ---------------- */
 
   // 官方安装方式（Claude Code：code.claude.com/docs/en/setup；Codex：chatgpt.com/codex/install.*）
@@ -1381,15 +1529,69 @@ class ZacSession {
 
   /* ---------- 选中内容、设置 ---------- */
 
-  setSelection(text, itemID) {
+  setSelection(text, itemID, meta = {}) {
     this.quote = text;
     if (itemID) this.itemID = itemID;
+    const ann = meta.annotation || null;
+    const pos = ann && ann.position && Number.isInteger(ann.position.pageIndex) && Array.isArray(ann.position.rects) ? ann.position : null;
+    const sel = (this.selection = {
+      text,
+      itemID: itemID || null,
+      position: pos,
+      pageLabel: (ann && ann.pageLabel) || (pos ? String(pos.pageIndex + 1) : ""),
+      sortIndex: (ann && ann.sortIndex) || "",
+      formula: zacLooksLikeFormula(text),
+      image: null,
+      useImage: false,
+      _reader: meta.reader || null,
+    });
     this.emit("quote");
     this.emit("context");
+    if (sel.formula && sel.position && sel._reader && this.p.getPref("autoSnipFormula") !== false) this.snip(sel);
   }
+
+  async snip(sel) {
+    try {
+      sel.snipping = true;
+      this.emit("quote");
+      const img = await this.p.captureSelection(sel._reader, sel);
+      if (img) {
+        sel.image = img;
+        sel.useImage = true;
+      } else sel.snipFailed = true;
+    } catch (e) {
+      sel.snipFailed = true;
+      this.p.log("snip failed: " + e);
+    } finally {
+      sel.snipping = false;
+      if (this.selection === sel) this.emit("quote");
+    }
+  }
+
+  // 输入框里引用的「截图」按钮：有截图就切换是否附带，没有就现截一张
+  toggleSnip() {
+    const sel = this.selection;
+    if (!sel) return;
+    if (sel.image) {
+      sel.useImage = !sel.useImage;
+      this.emit("quote");
+    } else if (sel.position && sel._reader && !sel.snipping) this.snip(sel);
+  }
+
   clearQuote() {
     this.quote = "";
+    this.selection = null;
     this.emit("quote");
+  }
+
+  // 打开原文并定位到选区
+  async jumpTo(sel) {
+    if (!sel || !sel.itemID) return;
+    try {
+      await Zotero.Reader.open(sel.itemID, sel.position ? { position: sel.position } : undefined);
+    } catch (e) {
+      Zotero.logError(e);
+    }
   }
   setPref(key, value) {
     this.p.setPref(key, value);
@@ -1443,7 +1645,7 @@ class ZacSession {
     };
   }
 
-  buildPrompt(question, quote, ctx) {
+  buildPrompt(question, quote, ctx, sel = null) {
     const parts = [String(this.p.getPref("systemPrompt") || "").trim() || ZAC_DEFAULT_SYSTEM, ""];
     if (ctx.title) parts.push(`【论文】${ctx.title}`);
     if (ctx.pdfPath && this.p.getPref("includePdfPath")) {
@@ -1454,12 +1656,26 @@ class ZacSession {
     if (hist.length) {
       parts.push("\n【此前的对话】");
       for (const t of hist) {
-        if (t.quote) parts.push(`用户选中：「${zacClip(t.quote, 600)}」`);
+        if (t.restored || t.quote) parts.push(`用户选中：「${zacClip(t.restored || t.quote, 600)}」`);
         parts.push(`用户：${t.question}`);
         parts.push(`助手：${zacClip(t.answer, 2000)}`);
       }
     }
-    if (quote) parts.push(`\n【用户当前选中的原文】\n"""\n${quote}\n"""`);
+    if (quote) {
+      const where = sel && sel.pageLabel ? `（第 ${sel.pageLabel} 页）` : "";
+      parts.push(`\n【用户当前选中的原文${where}】\n"""\n${quote}\n"""`);
+    }
+    if (sel && sel.image) {
+      parts.push(
+        `【选区截图】${sel.image.path}\n上面的文字来自 PDF 文本层，公式、上下标和特殊符号可能错乱或丢失，请先查看这张截图，以截图内容为准。`
+      );
+    }
+    if (sel && (sel.formula || sel.image)) {
+      parts.push(
+        "【输出要求】请在回答的最开头，把选中内容准确还原后放在 <restored> 和 </restored> 之间：" +
+          "数学公式用 LaTeX（行内 $...$，独立公式 $$...$$），保留公式编号；只还原原文，不要解释。然后另起一段回答问题。"
+      );
+    }
     parts.push(`\n【用户的问题】\n${question}`);
     return parts.join("\n");
   }
@@ -1473,10 +1689,23 @@ class ZacSession {
     const quote = zacClip(this.quote, 12000);
     if (!question && !quote) return false;
     if (!question) question = "请解释这段内容。";
+    const cur = this.selection && this.selection.text === this.quote ? this.selection : null;
+    const sel = cur
+      ? {
+          text: cur.text,
+          itemID: cur.itemID,
+          position: cur.position,
+          pageLabel: cur.pageLabel,
+          sortIndex: cur.sortIndex,
+          formula: cur.formula,
+          image: cur.useImage ? cur.image : null,
+        }
+      : null;
     this.quote = "";
+    this.selection = null;
     this.emit("quote");
 
-    const userMsg = { id: ++this._seq, role: "user", question, quote, ctxItemID };
+    const userMsg = { id: ++this._seq, role: "user", question, quote, ctxItemID, sel };
     const aMsg = { id: ++this._seq, role: "assistant", status: "pending", text: "" };
     this.messages.push(userMsg, aMsg);
     this.emit("append", userMsg);
@@ -1531,9 +1760,9 @@ class ZacSession {
   }
 
   async _run({ userMsg, cfg, aMsg, state, timeoutSec }) {
-    const { question, quote, ctxItemID } = userMsg;
+    const { question, quote, ctxItemID, sel } = userMsg;
     const ctx = await this.getContext(ctxItemID);
-    const prompt = this.buildPrompt(question, quote, ctx);
+    const prompt = this.buildPrompt(question, quote, ctx, sel);
     const pdfDir =
       this.p.getPref("includePdfPath") && ctx.pdfPath ? Zotero.File.pathToFile(ctx.pdfPath).parent.path : null;
     const { command, args, stdin } = this.p.buildCommand(cfg.agent, {
@@ -1541,6 +1770,7 @@ class ZacSession {
       prompt,
       model: cfg.model,
       effort: cfg.effort,
+      images: sel && sel.image ? [sel.image.path] : [],
     });
     const res = await this.p.spawn({
       command,
@@ -1553,7 +1783,18 @@ class ZacSession {
         this.emit("update", aMsg);
       },
     });
-    const answer = res.out.trim();
+    let answer = res.out.trim();
+    // 拆出 agent 还原的原文：<restored>…</restored>
+    let restored = "";
+    const rm = /<restored>([\s\S]*?)<\/restored>/i.exec(answer);
+    if (rm) {
+      restored = rm[1].trim();
+      answer = (answer.slice(0, rm.index) + answer.slice(rm.index + rm[0].length)).trim() || "（见上方还原的原文）";
+    }
+    if (restored && !state.cancelled && res.exitCode === 0) {
+      userMsg.restored = restored;
+      this.emit("update", userMsg);
+    }
     if (state.cancelled) {
       Object.assign(aMsg, {
         status: "error",
@@ -1567,7 +1808,17 @@ class ZacSession {
         .join("\n");
       Object.assign(aMsg, { status: "error", text: "agent 没有正常返回", hint: zacHint(cfg.agent, res.err + "\n" + answer), detail });
     } else {
-      const turn = { question, quote, answer, agent: cfg.agent, label: aMsg.label, parentID: ctx.parentID, libraryID: ctx.libraryID };
+      const turn = {
+        question,
+        quote,
+        restored: userMsg.restored || "",
+        sel,
+        answer,
+        agent: cfg.agent,
+        label: aMsg.label,
+        parentID: ctx.parentID,
+        libraryID: ctx.libraryID,
+      };
       this.turns.push(turn);
       Object.assign(aMsg, { status: "done", text: answer, turn, hint: "", detail: "" });
     }
@@ -1590,23 +1841,62 @@ class ZacSession {
     this.emit("reset");
   }
 
-  async saveNote(turn, answerHtml = null) {
-    const esc = (s) => Zotero.Utilities.htmlSpecialChars(String(s || ""));
-    const paras = (s) =>
-      String(s || "")
+  async saveNote(turn, { answerHtml = null, restoredHtml = null } = {}) {
+    const esc = (x) => Zotero.Utilities.htmlSpecialChars(String(x == null ? "" : x));
+    const paras = (x) =>
+      String(x || "")
         .split(/\n{2,}/)
         .map((p) => `<p>${esc(p).replace(/\n/g, "<br/>")}</p>`)
         .join("");
+    const sel = turn.sel || null;
+    const IMG = "\u0000ZAC_IMG\u0000";
     let html = `<h2>${esc("Agent 问答：" + zacClip(turn.question, 40))}</h2>`;
-    if (turn.quote) html += `<blockquote>${paras(turn.quote)}</blockquote>`;
+
+    // 原文：优先用 agent 对照截图还原的版本，并附原始截图供核对
+    if (restoredHtml) {
+      html += `<blockquote>${restoredHtml}</blockquote>`;
+      html += `<p><em>以上原文由 AI 根据${sel && sel.image ? "选区截图" : "选中文字"}还原${sel && sel.image ? "，请与下方截图核对" : "，请与原文核对"}。</em></p>`;
+    } else if (turn.quote) {
+      html += `<blockquote>${paras(turn.quote)}</blockquote>`;
+    }
+    if (sel && sel.image) html += IMG;
+
+    // 跳转到原文：zotero://open-pdf 链接；可选在原文建高亮，链接直达该处
+    if (sel && sel.position && sel.itemID) {
+      const att = Zotero.Items.get(sel.itemID);
+      if (att && att.isAttachment()) {
+        let annKey = null;
+        const isPDF = typeof att.isPDFAttachment === "function" ? att.isPDFAttachment() : att.attachmentContentType === "application/pdf";
+        if (isPDF && this.p.getPref("noteHighlight") !== false) annKey = await this.p.createHighlight(att, sel);
+        const href = this.p.openPdfURI(att, sel.position.pageIndex, annKey);
+        html += `<p><a href="${esc(href)}">↗ 跳转到原文（第 ${esc(sel.pageLabel || sel.position.pageIndex + 1)} 页）</a></p>`;
+      }
+    }
+
     html += `<p><strong>问：</strong>${esc(turn.question)}</p>`;
     html += `<p><strong>答（${esc(turn.label)}）：</strong></p>` + (answerHtml || zacNoteHtml(turn.answer, esc));
 
     const note = new Zotero.Item("note");
     note.libraryID = turn.libraryID || Zotero.Libraries.userLibraryID;
     if (turn.parentID) note.parentID = turn.parentID;
-    note.setNote(html);
+    note.setNote(html.replace(IMG, ""));
     await note.saveTx();
+
+    // 截图作为笔记内嵌图片（需要先有笔记 ID）
+    if (sel && sel.image) {
+      try {
+        const win = Zotero.getMainWindow();
+        const blob = new win.Blob([this.p.dataURLBytes(sel.image.dataURL)], { type: "image/png" });
+        const img = await Zotero.Attachments.importEmbeddedImage({ blob, parentItemID: note.id });
+        const w = Math.min(sel.image.cssWidth || sel.image.width, 640);
+        const h = Math.round(w * (sel.image.height / sel.image.width));
+        note.setNote(html.replace(IMG, `<p><img data-attachment-key="${img.key}" width="${w}" height="${h}"/></p>`));
+        await note.saveTx();
+      } catch (e) {
+        this.p.log("embed snip failed: " + e);
+      }
+    }
+    return note;
   }
 
   destroy() {
@@ -1663,6 +1953,12 @@ const ZAC_ICONS = {
   download: [["path", { d: "M12 15V3" }], ["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["path", { d: "m7 10 5 5 5-5" }]],
   login: [["path", { d: "m10 17 5-5-5-5" }], ["path", { d: "M15 12H3" }], ["path", { d: "M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" }]],
   gauge: [["path", { d: "m12 14 4-4" }], ["path", { d: "M3.34 19a10 10 0 1 1 17.32 0" }]],
+  image: [
+    ["rect", { width: "18", height: "18", x: "3", y: "3", rx: "2", ry: "2" }],
+    ["circle", { cx: "9", cy: "9", r: "2" }],
+    ["path", { d: "m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" }],
+  ],
+  link: [["path", { d: "M15 3h6v6" }], ["path", { d: "M10 14 21 3" }], ["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }]],
   alert: [
     ["circle", { cx: "12", cy: "12", r: "10" }],
     ["line", { x1: "12", x2: "12", y1: "8", y2: "12" }],
@@ -1807,6 +2103,23 @@ const ZAC_CSS = `
 .zac-user .zac-q svg.zac-i { width: 12px; height: 12px; margin-top: 3px; color: var(--zac-accent); }
 .zac-user .zac-q span { max-height: 4.6em; overflow: hidden; }
 .zac-assistant { align-self: stretch; }
+.zac-user .zac-q { display: block; }
+.zac-q-text { display: flex; gap: 6px; }
+.zac-q-text span { max-height: 4.6em; overflow: hidden; }
+.zac-q-tag { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; color: var(--zac-accent); margin-bottom: 4px; }
+.zac-q-tag svg.zac-i { width: 12px; height: 12px; }
+.zac-restored { color: var(--zac-fg); font-size: 12.5px; white-space: normal; }
+.zac-restored p { margin: 0 0 4px; }
+.zac-snip { display: block; max-width: 100%; max-height: 180px; margin: 6px 0 2px; border-radius: 6px;
+  border: 1px solid var(--zac-line); background: #fff; object-fit: contain; }
+.zac-view .zac-jump { display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; padding: 1px 7px 1px 5px;
+  border-radius: 10px; font-size: 11px; color: var(--zac-accent); background: color-mix(in srgb, var(--zac-accent) 10%, transparent); }
+.zac-view .zac-jump:hover { background: color-mix(in srgb, var(--zac-accent) 18%, transparent); }
+.zac-jump svg.zac-i { width: 11px; height: 11px; }
+.zac-q-question { white-space: pre-wrap; }
+.zac-quote-body { flex: 1; min-width: 0; }
+.zac-quote-meta { font-size: 10.5px; color: var(--zac-fg3); margin-top: 3px; }
+.zac-quote-btns { display: flex; flex-direction: column; gap: 2px; }
 .zac-msg-head { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--zac-fg2);
   margin-bottom: 4px; user-select: none; }
 .zac-avatar { width: 18px; height: 18px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center;
@@ -2037,12 +2350,15 @@ class ZacChatView {
 
     // 输入区：引用、快捷操作、输入框、模型选择、发送
     this.quoteText = this.el("div", { class: "zac-quote-text" });
+    this.quoteMeta = this.el("div", { class: "zac-quote-meta" });
+    this.quoteImg = this.el("img", { class: "zac-snip", alt: "选区截图" });
+    this.snipBtn = this.iconBtn("image", "附带选区截图（公式会自动截图）", () => this.s.toggleSnip());
     this.quoteEl = this.el(
       "div",
       { class: "zac-quote" },
       this.icon("quote"),
-      this.quoteText,
-      this.iconBtn("close", "不附带这段原文", () => this.s.clearQuote())
+      this.el("div", { class: "zac-quote-body" }, this.quoteText, this.quoteImg, this.quoteMeta),
+      this.el("div", { class: "zac-quote-btns" }, this.iconBtn("close", "不附带这段原文", () => this.s.clearQuote()), this.snipBtn)
     );
     this.chipsEl = this.el("div", { class: "zac-chips" });
     for (const [label, q] of ZAC_QUOTE_ACTIONS) {
@@ -2549,6 +2865,8 @@ class ZacChatView {
       ...group(
         "对话",
         toggle("includePdfPath", "允许 agent 读取论文全文", "把 PDF 路径告诉 agent，回答可以结合全文").row,
+        toggle("autoSnipFormula", "选中公式时自动截图", "PDF 里的公式复制出来常常是乱码，截图交给 agent 识别，并让它还原出准确的 LaTeX").row,
+        toggle("noteHighlight", "存为笔记时在原文创建高亮", "笔记里的「跳转到原文」会直接定位到这处高亮；关闭则只跳到对应页").row,
         field("historyTurns", "附带的历史轮数", "每次提问附带最近几轮问答，0 表示不附带", "number"),
         field("timeoutSec", "超时", "超过这个时间自动停止", "number"),
         field("systemPrompt", "系统提示词", "留空使用默认", "textarea", ZAC_DEFAULT_SYSTEM)
@@ -2892,6 +3210,20 @@ class ZacChatView {
       this.quoteText.textContent = zacClip(q, 400);
       this.quoteText.title = zacClip(q, 2000);
     }
+    const sel = this.s.selection && this.s.selection.text === q ? this.s.selection : null;
+    const showImg = !!(sel && sel.image && sel.useImage);
+    this.quoteImg.style.display = showImg ? "block" : "none";
+    if (showImg && this.quoteImg.getAttribute("src") !== sel.image.dataURL) this.quoteImg.setAttribute("src", sel.image.dataURL);
+    const canSnip = !!(sel && sel.position && sel._reader);
+    this.snipBtn.style.display = canSnip ? "" : "none";
+    this.snipBtn.classList.toggle("zac-active", showImg);
+    const meta = [];
+    if (sel && sel.pageLabel) meta.push(`第 ${sel.pageLabel} 页`);
+    if (sel && sel.snipping) meta.push("正在截图…");
+    else if (showImg) meta.push("已附截图，agent 会对照截图识别公式");
+    else if (sel && sel.formula) meta.push(sel.snipFailed ? "检测到公式，但截图失败" : "检测到公式");
+    this.quoteMeta.textContent = meta.join(" · ");
+    this.quoteMeta.style.display = meta.length ? "" : "none";
     this.updateSendState();
   }
 
@@ -2962,9 +3294,28 @@ class ZacChatView {
     if (m.role === "user") {
       const b = this.el("div", { class: "zac-msg zac-user" });
       if (m.quote) {
-        b.append(this.el("div", { class: "zac-q", title: zacClip(m.quote, 2000) }, this.icon("quote"), this.el("span", { text: zacClip(m.quote, 300) })));
+        const q = this.el("div", { class: "zac-q" });
+        if (m.restored) {
+          const md = this.el("div", { class: "zac-md zac-restored" });
+          this.renderMarkdown(md, m.restored);
+          q.append(this.el("div", { class: "zac-q-tag" }, this.icon("quote"), "原文（AI 对照截图还原）"), md);
+        } else {
+          q.append(this.el("div", { class: "zac-q-text", title: zacClip(m.quote, 2000) }, this.icon("quote"), this.el("span", { text: zacClip(m.quote, 300) })));
+        }
+        if (m.sel && m.sel.image) q.append(this.el("img", { class: "zac-snip", src: m.sel.image.dataURL, alt: "选区截图" }));
+        if (m.sel && m.sel.itemID && m.sel.position) {
+          q.append(
+            this.el(
+              "button",
+              { class: "zac-jump", title: "在阅读器中打开并定位到这段原文", onclick: () => this.s.jumpTo(m.sel) },
+              this.icon("link"),
+              `跳到原文 · 第 ${m.sel.pageLabel || m.sel.position.pageIndex + 1} 页`
+            )
+          );
+        }
+        b.append(q);
       }
-      b.append(this.el("div", { text: m.question }));
+      b.append(this.el("div", { class: "zac-q-question", text: m.question }));
       return b;
     }
 
@@ -3055,7 +3406,10 @@ class ZacChatView {
         onclick: async () => {
           noteBtn.disabled = true;
           try {
-            await this.s.saveNote(m.turn, this.markdownToNoteHtml(m.text));
+            await this.s.saveNote(m.turn, {
+              answerHtml: this.markdownToNoteHtml(m.text),
+              restoredHtml: m.turn && m.turn.restored ? this.markdownToNoteHtml(m.turn.restored) : null,
+            });
             noteBtn.replaceChildren(this.icon("check"), "已存为笔记");
           } catch (e) {
             Zotero.logError(e);

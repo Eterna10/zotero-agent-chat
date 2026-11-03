@@ -18,3 +18,6 @@ pref("extensions.zotero-agent-chat.floatingEnabled", true);
 pref("extensions.zotero-agent-chat.modelCache", "");
 pref("extensions.zotero-agent-chat.autoUpdateDefaultApplied", false);
 pref("extensions.zotero-agent-chat.autoUpdateRestored", false);
+pref("extensions.zotero-agent-chat.autoSnipFormula", true);
+pref("extensions.zotero-agent-chat.noteHighlight", true);
+pref("extensions.zotero-agent-chat.highlightColor", "#a28ae5");

@@ -3,9 +3,9 @@
     "agent-chat@eterna10.github.io": {
       "updates": [
         {
-          "version": "0.7.2",
-          "update_link": "https://raw.githubusercontent.com/Eterna10/zotero-agent-chat/main/releases/zotero-agent-chat-0.7.2.xpi",
-          "update_hash": "sha256:a86f4c5420d4d7f50897bc2f4f88e601c3949121a1e3a399a8f1a1c3a2066bb2",
+          "version": "0.8.0",
+          "update_link": "https://raw.githubusercontent.com/Eterna10/zotero-agent-chat/main/releases/zotero-agent-chat-0.8.0.xpi",
+          "update_hash": "sha256:b2b8a5dda192a6b721265d291ca4b015cafab06f250a975bd715e83825d41447",
           "applications": {
             "zotero": {
               "strict_min_version": "6.999",
