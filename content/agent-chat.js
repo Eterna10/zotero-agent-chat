@@ -25,6 +25,7 @@ const ZAC_EFFORTS = {
 const ZAC_DEFAULT_SYSTEM =
   "你是科研论文阅读助手。用户正在 Zotero 中阅读论文，会提供选中的原文片段和问题。" +
   "请用与用户提问相同的语言，准确、简洁地回答；必要时解释公式中各符号的含义并给出直观理解。" +
+  "数学公式使用 LaTeX：行内公式写成 $...$，独立公式写成 $$...$$。" +
   "只读取文件，不要修改或创建任何文件。";
 
 function zacClip(s, n) {
@@ -92,6 +93,29 @@ function zacEffortLabel(agent, v) {
   if (!v) return "";
   const names = ZAC_EFFORT_NAMES[agent] || {};
   return names[v] || String(v).charAt(0).toUpperCase() + String(v).slice(1);
+}
+
+// 行内公式：$...$（首尾不能是空格、结尾 $ 后不能紧跟数字，避免把 "$5 和 $10" 当成公式）或 \(...\)
+const ZAC_INLINE_MATH = /\\\((.+?)\\\)|\$(?!\s)((?:\\\$|[^$\n])+?)(?<!\s)\$(?!\d)/g;
+
+// 存为 Zotero 笔记时把公式转成笔记编辑器认识的格式：<pre class="math">$$..$$</pre> 和 <span class="math">$..$</span>
+function zacNoteHtml(text, esc) {
+  const out = [];
+  const parts = String(text || "").split(/(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\])/);
+  for (const part of parts) {
+    if (!part) continue;
+    const dm = /^\$\$([\s\S]+)\$\$$/.exec(part) || /^\\\[([\s\S]+)\\\]$/.exec(part);
+    if (dm) {
+      out.push(`<pre class="math">$$${esc(dm[1].trim())}$$</pre>`);
+      continue;
+    }
+    for (const para of part.split(/\n{2,}/)) {
+      if (!para.trim()) continue;
+      const html = esc(para.replace(/^\n+|\n+$/g, "")).replace(new RegExp(ZAC_INLINE_MATH.source, "g"), (m, a, b) => `<span class="math">$${a ?? b}$</span>`);
+      out.push(`<p>${html.replace(/\n/g, "<br/>")}</p>`);
+    }
+  }
+  return out.join("");
 }
 
 // 时间：ISO 字符串、Unix 秒或毫秒 → 毫秒
@@ -243,6 +267,22 @@ var AgentChat = {
     const list = seen.size ? [...seen.values()] : (ZAC_EFFORTS[agent] || []).map((v) => ({ value: v }));
     return { list, defaultEffort: "", known: false };
   },
+  // KaTeX（content/lib/katex.min.js，MIT）：只用它把 LaTeX 转成 MathML，由 Zotero（Firefox 内核）原生排版，不需要字体和样式表
+  getKatex() {
+    if (this._katex !== undefined) return this._katex;
+    try {
+      if (typeof katex !== "undefined") return (this._katex = katex); // 浏览器预览环境
+      const scope = {};
+      scope.self = scope;
+      Services.scriptloader.loadSubScript(this.rootURI + "content/lib/katex.min.js", scope);
+      this._katex = scope.katex || null;
+    } catch (e) {
+      this.log("load katex failed: " + e);
+      this._katex = null;
+    }
+    return this._katex;
+  },
+
   floatingEnabled() {
     return this.getPref("floatingEnabled") !== false;
   },
@@ -1560,7 +1600,7 @@ class ZacSession {
     let html = `<h2>${esc("Agent 问答：" + zacClip(turn.question, 40))}</h2>`;
     if (turn.quote) html += `<blockquote>${paras(turn.quote)}</blockquote>`;
     html += `<p><strong>问：</strong>${esc(turn.question)}</p>`;
-    html += `<p><strong>答（${esc(turn.label)}）：</strong></p>` + paras(turn.answer);
+    html += `<p><strong>答（${esc(turn.label)}）：</strong></p>` + zacNoteHtml(turn.answer, esc);
 
     const note = new Zotero.Item("note");
     note.libraryID = turn.libraryID || Zotero.Libraries.userLibraryID;
@@ -1780,6 +1820,9 @@ const ZAC_CSS = `
 .zac-md .zac-li-mark { position: absolute; left: 2px; color: var(--zac-fg2); }
 .zac-md blockquote { margin: 6px 0 8px; padding: 2px 10px; border-left: 3px solid var(--zac-line); color: var(--zac-fg2); white-space: pre-wrap; }
 .zac-md hr { border: none; border-top: 1px solid var(--zac-line); margin: 10px 0; }
+.zac-math math { font-size: 1.08em; }
+.zac-math-display { margin: 6px 0 10px; overflow-x: auto; overflow-y: hidden; padding: 2px 0; text-align: center; }
+.zac-math-display math { display: block; margin: 0 auto; width: fit-content; max-width: 100%; font-size: 1.12em; }
 .zac-inline-code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; background: var(--zac-soft);
   padding: 1px 5px; border-radius: 5px; }
 .zac-codeblock { margin: 6px 0 10px; border: 1px solid var(--zac-line); border-radius: 10px; overflow: hidden; }
@@ -3040,7 +3083,21 @@ class ZacChatView {
 
   renderMarkdown(box, text) {
     box.replaceChildren();
-    const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+    // 先把独立公式 $$...$$ / \[...\] 换成占位行（代码块里的不动），逐行解析时再渲染
+    const maths = [];
+    const src = String(text || "")
+      .replace(/\r\n/g, "\n")
+      .split(/(```[\s\S]*?(?:```|$))/)
+      .map((seg, i) =>
+        i % 2
+          ? seg
+          : seg.replace(/\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g, (m, a, b) => {
+              maths.push((a ?? b).trim());
+              return `\n\u0000M${maths.length - 1}\u0000\n`;
+            })
+      )
+      .join("");
+    const lines = src.split("\n");
     let para = [];
     const flush = () => {
       if (!para.length) return;
@@ -3054,6 +3111,12 @@ class ZacChatView {
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
+      const mm = /^\s*\u0000M(\d+)\u0000\s*$/.exec(line);
+      if (mm) {
+        flush();
+        box.append(this.el("div", { class: "zac-math-display" }, this.renderMath(maths[+mm[1]], true)));
+        continue;
+      }
       const fence = /^\s*```\s*([\w+-]*)/.exec(line);
       if (fence) {
         flush();
@@ -3159,17 +3222,41 @@ class ZacChatView {
   }
 
   renderInline(parent, text) {
-    const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\s][^*\n]*\*)/g;
+    const re = new RegExp("(`[^`\\n]+`)|" + ZAC_INLINE_MATH.source + "|\\*\\*([^*\\n]+)\\*\\*|\\*([^*\\s][^*\\n]*)\\*", "g");
     let last = 0;
     let m;
     while ((m = re.exec(text))) {
       if (m.index > last) parent.append(text.slice(last, m.index));
-      const t = m[0];
-      if (t.startsWith("**")) parent.append(this.el("strong", { text: t.slice(2, -2) }));
-      else if (t.startsWith("`")) parent.append(this.el("code", { class: "zac-inline-code", text: t.slice(1, -1) }));
-      else parent.append(this.el("em", { text: t.slice(1, -1) }));
-      last = m.index + t.length;
+      if (m[1]) parent.append(this.el("code", { class: "zac-inline-code", text: m[1].slice(1, -1) }));
+      else if (m[2] != null || m[3] != null) parent.append(this.renderMath((m[2] ?? m[3]).trim(), false));
+      else if (m[4] != null) {
+        const st = this.el("strong");
+        this.renderInline(st, m[4]);
+        parent.append(st);
+      } else {
+        const em = this.el("em");
+        this.renderInline(em, m[5]);
+        parent.append(em);
+      }
+      last = m.index + m[0].length;
     }
     if (last < text.length) parent.append(text.slice(last));
+  }
+
+  // LaTeX → MathML（KaTeX 只做转换，排版交给 Zotero 自带的 MathML 引擎）；失败时原样显示
+  renderMath(tex, display) {
+    const k = this.p.getKatex();
+    if (k) {
+      try {
+        const html = k.renderToString(tex, { output: "mathml", displayMode: display, throwOnError: false, strict: "ignore", trust: false });
+        const parsed = new this.win.DOMParser().parseFromString(`<!doctype html><html><body>${html}</body></html>`, "text/html");
+        const span = this.el("span", { class: display ? "zac-math zac-math-block" : "zac-math", "data-tex": tex });
+        for (const n of [...parsed.body.childNodes]) span.append(this.doc.importNode(n, true));
+        return span;
+      } catch (e) {
+        this.p.log("katex: " + e);
+      }
+    }
+    return this.el("code", { class: "zac-inline-code", text: display ? `$$${tex}$$` : `$${tex}$` });
   }
 }
