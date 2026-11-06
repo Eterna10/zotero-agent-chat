@@ -22,3 +22,6 @@ pref("extensions.zotero-agent-chat.autoSnipFormula", true);
 pref("extensions.zotero-agent-chat.noteHighlight", true);
 pref("extensions.zotero-agent-chat.highlightColor", "#a28ae5");
 pref("extensions.zotero-agent-chat.fontScale", 100);
+pref("extensions.zotero-agent-chat.agyPath", "agy");
+pref("extensions.zotero-agent-chat.agyModel", "");
+pref("extensions.zotero-agent-chat.agyEffort", "");

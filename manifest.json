@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Agent Chat for Zotero",
-  "version": "0.8.3",
-  "description": "选中 PDF 文字，在悬浮窗口或侧边栏中向本机的 Claude Code / Codex 提问。",
+  "version": "0.9.0",
+  "description": "选中 PDF 文字，在悬浮窗口或侧边栏中向本机的 Claude Code / Codex / Antigravity 提问。",
   "author": "Eta",
   "icons": {
     "48": "icons/chat.svg",

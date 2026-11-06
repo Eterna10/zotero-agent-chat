@@ -4,6 +4,17 @@
 
 支持 Zotero 7、8、9、10。
 
+## 支持的 agent
+
+| Agent | 命令 | 登录 |
+|---|---|---|
+| Claude Code | `claude` | Claude 账号 |
+| Codex | `codex` | ChatGPT 账号（`codex login`） |
+| Antigravity | `agy`（Google 的 Antigravity CLI，Gemini CLI 的替代品） | Google 账号（首次运行 `agy` 登录） |
+| 自定义 | 任意命令 | — |
+
+三个内置 agent 都有模型 / Effort 下拉框、额度显示、一键安装和诊断。
+
 ## 界面
 
 悬浮窗口和侧边栏「Agent 对话」区块是**同一个对话的两个视图**，记录、引用、运行状态同步。
@@ -40,6 +51,7 @@ PDF 文本层不保存公式结构，选中复制出来的公式常是乱码（�
 |---|---|---|
 | Claude Code | stream-json 模式下的 `get_usage` 控制请求（与 `/usage` 同源） | 订阅类型；5 小时、每周（全部模型 / Opus / Sonnet / 按模型）窗口；额外用量 |
 | Codex | `codex app-server` 的 `account/rateLimits/read` | 订阅类型；5 小时、每周窗口；剩余 credits |
+| Antigravity | 打开额度面板时运行 `agy -p /usage`，解析文本中的百分比（解析不出时显示原始输出） | 各额度窗口的已用比例和重置说明；不在后台自动刷新，点面板里的刷新按钮更新 |
 
 打开界面时读取一次（5 分钟内用缓存），每次回答完成后自动刷新，面板里也可以手动刷新。用 API Key 登录时没有订阅额度，会显示按用量计费的说明。
 
@@ -51,6 +63,7 @@ PDF 文本层不保存公式结构，选中复制出来的公式常是乱码（�
 |---|---|---|
 | Claude Code | `irm https://claude.ai/install.ps1 \| iex` | `curl -fsSL https://claude.ai/install.sh \| bash` |
 | Codex | `irm https://chatgpt.com/codex/install.ps1 \| iex` | `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` |
+| Antigravity | `irm https://antigravity.google/cli/install.ps1 \| iex` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` |
 
 安装输出实时显示在设置页。完成后会询问是否打开终端登录（`claude` 或 `codex login`），登录需要在浏览器里授权；之后点「诊断连接」确认。安装失败时会给出原因和可以手动执行的命令。
 
@@ -72,6 +85,7 @@ PDF 文本层不保存公式结构，选中复制出来的公式常是乱码（�
 |---|---|---|
 | Claude Code | 以 SDK 模式启动 `claude -p --input-format stream-json --output-format stream-json --verbose`，发送 `initialize` 控制请求 | 模型别名、显示名（如 Opus 5.5）、说明、每个模型支持的 effort 档位 |
 | Codex | 启动 `codex app-server`，JSON-RPC 调用 `initialize` → `model/list` | 模型名、显示名、默认模型、每个模型支持的推理强度及默认档位 |
+| Antigravity | 运行 `agy models`，解析其输出（列表、表格或 JSON） | 当前账号可用的模型名称；Effort 为 Low / Medium / High |
 
 - 打开对话界面时在后台获取一次，结果缓存 24 小时；⚙ 里可以点「从本机刷新模型列表」立即更新。
 - Effort 选项随所选模型变化；所选模型不支持调节 effort 时下拉框显示「不支持」，命令里不会带 effort 参数。
@@ -105,6 +119,7 @@ macOS / Linux 用 `which claude`。
 |---|---|
 | Claude Code | `claude -p [--model M] [--effort E] [--add-dir <PDF 所在目录>]` |
 | Codex | `codex exec --skip-git-repo-check --sandbox read-only [-m M] [-c model_reasoning_effort=E] -` |
+| Antigravity | `agy -p <提示词> [--model M] [--effort E] [--add-dir <PDF 所在目录>]`（提示词作为参数传入；Windows 上过长时自动减少附带的历史轮数） |
 | 自定义 | `<命令> <参数>`；参数含 `{prompt}` 时作为参数传入，否则走 stdin；`{pdf_dir}` 替换为 PDF 目录 |
 
 工作目录是 `<Zotero 数据目录>/agent-chat`。Claude 用默认权限模式，Codex 用只读沙箱。

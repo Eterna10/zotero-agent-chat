@@ -10,16 +10,18 @@
 /* global Zotero, Cc, Ci, ChromeUtils */
 
 const ZAC_NS = "http://www.w3.org/1999/xhtml";
-const ZAC_AGENTS = { claude: "Claude Code", codex: "Codex", custom: "自定义" };
+const ZAC_AGENTS = { claude: "Claude Code", codex: "Codex", agy: "Antigravity", custom: "自定义" };
 // 下拉框里的预设；不在列表里的可以选「自定义…」手动输入
 const ZAC_MODELS = {
   claude: ["sonnet", "opus", "haiku", "fable"],
   codex: ["gpt-5.4", "gpt-5.4-mini"],
+  agy: [],
   custom: [],
 };
 const ZAC_EFFORTS = {
   claude: ["low", "medium", "high", "xhigh", "max"], // claude --effort
   codex: ["minimal", "low", "medium", "high", "xhigh"], // codex -c model_reasoning_effort=
+  agy: ["low", "medium", "high"], // agy --effort
   custom: [],
 };
 const ZAC_DEFAULT_SYSTEM =
@@ -88,6 +90,7 @@ function zacDisambiguate(models) {
 const ZAC_EFFORT_NAMES = {
   claude: { low: "Low", medium: "Medium", high: "High", xhigh: "Extra", max: "Max", ultracode: "Ultracode" },
   codex: { none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high" },
+  agy: { low: "Low", medium: "Medium", high: "High" },
 };
 function zacEffortLabel(agent, v) {
   if (!v) return "";
@@ -130,6 +133,73 @@ function zacLooksLikeFormula(text) {
   const shortTokens = (t.match(/(?:^|\s)[A-Za-z](?=\s|$)/g) || []).length; // 散落的单个字母（上下标被拆开）
   const score = greek * 2 + ops * 1.5 + accents * 2 + mathAlnum * 2 + eqNo + (shortTokens >= 3 ? 2 : 0);
   return score >= 4 && score / Math.max(t.length, 1) > 0.025;
+}
+
+// 去掉终端颜色等控制字符
+function zacStripAnsi(t) {
+  return String(t || "").replace(/\u001b\[[0-9;?]*[ -\/]*[@-~]|\u001b\][^\u0007]*\u0007|\r/g, "");
+}
+
+// 解析 `agy models` 的输出：兼容 JSON、表格、带编号或符号的列表；标出当前 / 默认模型
+function zacParseModelList(text) {
+  const raw = zacStripAnsi(text).trim();
+  if (!raw) return [];
+  if (/^[\[{]/.test(raw)) {
+    try {
+      let j = JSON.parse(raw);
+      if (!Array.isArray(j)) j = j.models || j.data || j.items || [];
+      return j
+        .map((m) => {
+          if (typeof m === "string") return { value: m, label: m };
+          const value = String(m.id ?? m.model ?? m.name ?? m.value ?? "");
+          return { value, label: String(m.displayName ?? m.display_name ?? m.name ?? value), description: m.description || "", isDefault: !!(m.default || m.isDefault || m.current) };
+        })
+        .filter((m) => m.value);
+    } catch (e) {}
+  }
+  const out = [];
+  const seen = new Set();
+  for (let line of raw.split("\n")) {
+    line = line.replace(/\s+$/, "");
+    if (!line.trim()) continue;
+    if (/^[\s\-=─━═│┃|+_.·*]+$/.test(line)) continue; // 分隔线
+    if (/^\s*(available models|models?|model\s+(name|id)|name|id)\b/i.test(line) && !/\d/.test(line)) continue;
+    if (/^\s*(use|run|tip|hint|try|see|type|note|usage)\b/i.test(line) || /\s--[a-z]|<[^>]+>/i.test(line)) continue; // 用法提示
+    if (/:\s*$/.test(line)) continue; // 小标题
+    let cur = false;
+    if (/^\s*[*✓✔●►>→]\s+/.test(line) || /\((current|default|selected|active|当前|默认)\)/i.test(line)) cur = true;
+    line = line
+      .replace(/^\s*(?:[*•\-–●○►>→✓✔]|\d+[.)])\s+/, "")
+      .replace(/\s*\((current|default|selected|active|当前|默认)\)\s*/gi, " ")
+      .trim();
+    let cols = line.includes("│") || line.includes("|") ? line.split(/[│|]/).map((c) => c.trim()).filter(Boolean) : line.split(/\t+|\s{2,}/).map((c) => c.trim()).filter(Boolean);
+    if (!cols.length) continue;
+    if (cols.slice(1).some((c) => /^(default|current|selected|默认|当前)$/i.test(c))) cur = true;
+    const value = cols[0];
+    if (value.length > 80 || /^(model|name|id)$/i.test(value)) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push({ value, label: value, description: cols.slice(1).join(" · "), isDefault: cur });
+  }
+  return out;
+}
+
+// 解析 `/usage` 的文本输出：找出带百分比的行作为额度窗口
+function zacParseUsageText(text) {
+  const lines = zacStripAnsi(text).split("\n").map((l) => l.trim()).filter(Boolean);
+  const windows = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const m = /(\d{1,3}(?:\.\d+)?)\s*%/.exec(l);
+    if (!m) continue;
+    let pct = parseFloat(m[1]);
+    if (/remain|left|available|剩余|可用/i.test(l)) pct = 100 - pct;
+    let label = l.replace(m[0], "").replace(/\b(used|consumed)\b|已用|已使用/gi, "").replace(/[█▓▒░■□▏▎▍▌▋▊▉\[\]#=\-]{3,}/g, "").replace(/\s{2,}/g, " ").replace(/[:：·|]\s*$/, "").trim();
+    if (!label && i > 0 && !/%/.test(lines[i - 1])) label = lines[i - 1];
+    const resetLine = [l, lines[i + 1] || ""].find((x) => /reset|refresh|renew|重置|刷新/i.test(x)) || "";
+    windows.push({ label: label || "额度", usedPercent: Math.max(0, Math.min(100, pct)), resetsAt: 0, resetText: resetLine && resetLine !== l ? resetLine : "" });
+  }
+  return windows;
 }
 
 // 时间：ISO 字符串、Unix 秒或毫秒 → 毫秒
@@ -202,11 +272,14 @@ function zacHint(agent, text) {
         ? "这台电脑上没有找到 Codex CLI（也没有找到编辑器扩展自带的 codex.exe）。安装：npm install -g @openai/codex（需要 Node.js 22 及以上），然后运行 codex login 登录；装好后在设置里点「诊断连接」。"
         : agent === "claude"
           ? "没有找到 Claude Code。安装后（官方安装脚本或 npm install -g @anthropic-ai/claude-code）在终端运行 claude 完成登录，再点「诊断连接」。"
+          : agent === "agy"
+            ? "没有找到 Antigravity CLI（agy）。可以在设置里点「安装 / 更新」，或在 PowerShell 运行 irm https://antigravity.google/cli/install.ps1 | iex；装好后运行 agy 用 Google 账号登录，再点「诊断连接」。"
           : `找不到命令。请在终端运行 where.exe <命令> 查出完整路径（.exe 或 .cmd），填到设置里的「命令」。`],
     [/not logged in|log ?in required|please (run )?.*login|unauthori[sz]ed|\b401\b|invalid api key|authentication/i,
       agent === "codex" ? "Codex 尚未登录或登录已过期：在终端运行 codex login。" : `${name} 尚未登录或登录已过期，请在终端里登录后重试。`],
     [/unexpected argument|unrecognized (option|argument)|unknown (option|argument|flag)|found argument .* which wasn't expected/i,
-      `${name} 版本可能过旧，不认识插件使用的参数。请更新：` + (agent === "codex" ? "npm i -g @openai/codex@latest" : "claude update")],
+      `${name} 版本可能过旧，不认识插件使用的参数。请更新：` +
+        (agent === "codex" ? "在设置里点「安装 / 更新」，或 npm i -g @openai/codex@latest" : agent === "agy" ? "在设置里点「安装 / 更新」，或运行 agy update" : "claude update")],
     // 注意 codex 的 stderr 抬头会打印 "reasoning effort: xxx"、"sandbox: read-only"，规则必须带上错误字样
     [/(unsupported|invalid|not supported|unknown variant|not allowed).{0,60}effort|effort.{0,60}(unsupported|invalid|not supported|unknown variant|not allowed)/i,
       "所选 Effort 不被当前模型支持，改为「默认」或刷新模型列表后重试。"],
@@ -490,6 +563,14 @@ var AgentChat = {
       args.push("-");
       return { command: g("codexPath") || "codex", args, stdin: prompt };
     }
+    if (agent === "agy") {
+      // agy 的非交互模式只接受 -p 后面的参数作为提示词（文档未说明可从 stdin 读取）
+      const args = ["-p", prompt];
+      if (model) args.push("--model", model);
+      if (effort) args.push("--effort", effort);
+      if (pdfDir) args.push("--add-dir", pdfDir);
+      return { command: g("agyPath") || "agy", args, stdin: "", promptAsArg: true };
+    }
     const command = g("customCommand");
     if (!command) throw new Error("请先在设置（⚙）中填写自定义命令");
     let args = zacSplitArgs(g("customArgs"));
@@ -497,7 +578,7 @@ var AgentChat = {
     args = args.map((a) =>
       a.replace(/\{prompt\}/g, () => prompt).replace(/\{pdf_dir\}/g, () => pdfDir || "").replace(/\{image\}/g, () => images[0] || "")
     );
-    return { command, args, stdin: promptAsArg ? "" : prompt };
+    return { command, args, stdin: promptAsArg ? "" : prompt, promptAsArg };
   },
 
   envGet(k) {
@@ -525,11 +606,15 @@ var AgentChat = {
           this.envGet("LOCALAPPDATA") && this.envGet("LOCALAPPDATA") + "\\Programs\\nodejs",
           // Codex 官方独立安装脚本的命令目录（安装时写入用户 PATH，已打开的 Zotero 看不到，所以这里补上）
           this.envGet("LOCALAPPDATA") && this.envGet("LOCALAPPDATA") + "\\Programs\\OpenAI\\Codex\\bin",
+          // Antigravity CLI（agy）安装脚本的位置
+          this.envGet("LOCALAPPDATA") && this.envGet("LOCALAPPDATA") + "\\agy\\bin",
+          this.envGet("LOCALAPPDATA") && this.envGet("LOCALAPPDATA") + "\\Antigravity",
           "C:\\Program Files\\nodejs",
         ]
       : [
           home + "/.local/bin",
           home + "/.claude/local",
+          home + "/.agy/bin",
           "/opt/homebrew/bin",
           "/usr/local/bin",
           home + "/.npm-global/bin",
@@ -907,7 +992,29 @@ var AgentChat = {
   async discoverModels(agent) {
     if (agent === "claude") return this.discoverClaudeModels();
     if (agent === "codex") return this.discoverCodexModels();
+    if (agent === "agy") return this.discoverAgyModels();
     return [];
+  },
+
+  // Antigravity：`agy models` 列出当前账号可用的模型
+  async discoverAgyModels() {
+    const { command } = this.buildCommand("agy", {});
+    const state = {};
+    const win = Zotero.getMainWindow();
+    const timer = win.setTimeout(() => { state.cancelled = true; try { state.proc && state.proc.kill(); } catch (e) {} }, 30000);
+    let r;
+    try {
+      r = await this.spawn({ command, args: ["models"], state });
+    } finally {
+      win.clearTimeout(timer);
+    }
+    if (state.cancelled) throw new Error("agy models 超时");
+    const models = zacParseModelList(r.out);
+    if (r.exitCode !== 0 || !models.length) {
+      throw new Error(zacTail((r.err || r.out || "").trim(), 600) || `agy models 退出码 ${r.exitCode}`);
+    }
+    const efforts = ZAC_EFFORTS.agy.map((v) => ({ value: v }));
+    return models.map((m) => ({ ...m, efforts, supportsEffort: true }));
   },
 
   // Claude Code：以 SDK 的 stream-json 模式启动，发 initialize 控制请求，回应里带 models
@@ -1199,6 +1306,11 @@ var AgentChat = {
         ? { script: "irm https://claude.ai/install.ps1 | iex", manual: "irm https://claude.ai/install.ps1 | iex", loginArgs: [], loginText: "claude" }
         : { script: "curl -fsSL https://claude.ai/install.sh | bash", manual: "curl -fsSL https://claude.ai/install.sh | bash", loginArgs: [], loginText: "claude" };
     }
+    if (agent === "agy") {
+      return Zotero.isWin
+        ? { script: "irm https://antigravity.google/cli/install.ps1 | iex", manual: "irm https://antigravity.google/cli/install.ps1 | iex", loginArgs: [], loginText: "agy" }
+        : { script: "curl -fsSL https://antigravity.google/cli/install.sh | bash", manual: "curl -fsSL https://antigravity.google/cli/install.sh | bash", loginArgs: [], loginText: "agy" };
+    }
     if (agent === "codex") {
       return Zotero.isWin
         ? { script: "irm https://chatgpt.com/codex/install.ps1 | iex", manual: 'powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"', loginArgs: ["login"], loginText: "codex login" }
@@ -1308,7 +1420,44 @@ var AgentChat = {
   async fetchUsage(agent) {
     if (agent === "claude") return this.fetchClaudeUsage();
     if (agent === "codex") return this.fetchCodexUsage();
+    if (agent === "agy") return this.fetchAgyUsage();
     return null;
+  },
+
+  // Antigravity：在非交互模式下执行 /usage 斜杠命令，解析文本里的百分比；解析不出来就显示原文
+  async fetchAgyUsage() {
+    const { command } = this.buildCommand("agy", {});
+    const state = {};
+    const win = Zotero.getMainWindow();
+    const timer = win.setTimeout(() => { state.cancelled = true; try { state.proc && state.proc.kill(); } catch (e) {} }, 45000);
+    let r;
+    try {
+      r = await this.spawn({ command, args: ["-p", "/usage"], state });
+    } finally {
+      win.clearTimeout(timer);
+    }
+    if (state.cancelled) throw new Error("读取额度超时");
+    const text = zacStripAnsi(r.out || "").trim();
+    if (r.exitCode !== 0 && !text) throw new Error(zacTail((r.err || "").trim(), 600) || `退出码 ${r.exitCode}`);
+    const windows = zacParseUsageText(text);
+    const looksLikeUsage = windows.length || /quota|credit|usage|limit|额度|配额/i.test(text);
+    if (!looksLikeUsage) {
+      return {
+        plan: "",
+        windows: [],
+        extras: [],
+        note: "当前版本的 agy 在非交互模式下不返回额度信息。可以在终端运行 agy，然后输入 /usage 查看。",
+      };
+    }
+    return { plan: "", windows, extras: [], note: windows.length ? "" : "", raw: text };
+  },
+
+  // agy 读取额度要单独启动一次 agy，只在用户打开额度面板时读取，不在后台自动刷新
+  usageSupported(agent) {
+    return agent === "claude" || agent === "codex" || agent === "agy";
+  },
+  usageAuto(agent) {
+    return agent === "claude" || agent === "codex";
   },
 
   // Claude Code：stream-json 模式下先 initialize，再发 get_usage 控制请求（与 /usage 同源）
@@ -1430,8 +1579,9 @@ var AgentChat = {
   },
 
   // force=false 时 5 分钟内用缓存；同一 agent 同时只请求一次
-  refreshUsage(agent, force = false) {
-    if (agent !== "claude" && agent !== "codex") return Promise.resolve(null);
+  refreshUsage(agent, force = false, manual = false) {
+    if (!this.usageSupported(agent)) return Promise.resolve(null);
+    if (!manual && !this.usageAuto(agent)) return Promise.resolve(this._usage && this._usage[agent] ? this._usage[agent].data : null);
     this._usage = this._usage || {};
     this._usageReq = this._usageReq || {};
     const cur = this._usage[agent];
@@ -1664,13 +1814,13 @@ class ZacSession {
     };
   }
 
-  buildPrompt(question, quote, ctx, sel = null) {
+  buildPrompt(question, quote, ctx, sel = null, historyOverride = null) {
     const parts = [String(this.p.getPref("systemPrompt") || "").trim() || ZAC_DEFAULT_SYSTEM, ""];
     if (ctx.title) parts.push(`【论文】${ctx.title}`);
     if (ctx.pdfPath && this.p.getPref("includePdfPath")) {
       parts.push(`【PDF 本地路径】${ctx.pdfPath}\n（需要更多上下文时可以读取这个文件，但不要修改任何文件。）`);
     }
-    const n = Math.max(0, parseInt(this.p.getPref("historyTurns"), 10) || 0);
+    const n = historyOverride != null ? historyOverride : Math.max(0, parseInt(this.p.getPref("historyTurns"), 10) || 0);
     const hist = n ? this.turns.slice(-n) : [];
     if (hist.length) {
       parts.push("\n【此前的对话】");
@@ -1782,7 +1932,14 @@ class ZacSession {
   async _run({ userMsg, cfg, aMsg, state, timeoutSec }) {
     const { question, quote, ctxItemID, sel } = userMsg;
     const ctx = await this.getContext(ctxItemID);
-    const prompt = this.buildPrompt(question, quote, ctx, sel);
+    let prompt = this.buildPrompt(question, quote, ctx, sel);
+    const asArg = cfg.agent === "agy" || (cfg.agent === "custom" && /\{prompt\}/.test(String(this.p.getPref("customArgs") || "")));
+    if (asArg && Zotero.isWin) {
+      for (let n = parseInt(this.p.getPref("historyTurns"), 10) || 0; prompt.length > 26000 && n > 0; n--) {
+        prompt = this.buildPrompt(question, quote, ctx, sel, n - 1);
+      }
+      if (prompt.length > 26000) prompt = prompt.slice(0, 13000) + "\n…（中间内容过长已省略）…\n" + prompt.slice(-12000);
+    }
     const pdfDir =
       this.p.getPref("includePdfPath") && ctx.pdfPath ? Zotero.File.pathToFile(ctx.pdfPath).parent.path : null;
     const { command, args, stdin } = this.p.buildCommand(cfg.agent, {
@@ -2050,6 +2207,10 @@ const ZAC_CSS = `
 .zac-u-reset { font-size: calc(10.5px * var(--zac-fs, 1)); color: var(--zac-fg2); }
 .zac-u-note { font-size: calc(11.5px * var(--zac-fs, 1)); color: var(--zac-fg2); margin-top: 4px; }
 .zac-u-err { font-size: calc(11.5px * var(--zac-fs, 1)); color: var(--zac-danger); margin-top: 4px; white-space: pre-wrap; }
+.zac-u-raw { margin-top: 6px; font-size: calc(11px * var(--zac-fs, 1)); color: var(--zac-fg2); }
+.zac-u-raw summary { cursor: pointer; user-select: none; }
+.zac-u-raw pre { margin: 4px 0 0; white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: calc(10.5px * var(--zac-fs, 1)); max-height: 180px; overflow: auto; }
 .zac-u-foot { font-size: calc(10.5px * var(--zac-fs, 1)); color: var(--zac-fg3); margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--zac-line); }
 .zac-spin svg.zac-i { animation: zac-rot 1s linear infinite; }
 @keyframes zac-rot { to { transform: rotate(360deg); } }
@@ -2588,7 +2749,7 @@ class ZacChatView {
   renderUsage() {
     if (!this.usageBtn) return;
     const agent = this.p.currentAgent();
-    const show = agent === "claude" || agent === "codex";
+    const show = this.p.usageSupported(agent);
     this.usageBtn.style.display = show ? "" : "none";
     if (!show) {
       this.hideUsage();
@@ -2623,7 +2784,7 @@ class ZacChatView {
     this.usageBtn.classList.add("zac-active");
     this.renderUsagePop();
     const st = this.p.usageState(this.p.currentAgent());
-    if (!st.ts || Date.now() - st.ts > 60 * 1000) this.p.refreshUsage(this.p.currentAgent(), true);
+    if (!st.ts || Date.now() - st.ts > 60 * 1000) this.p.refreshUsage(this.p.currentAgent(), true, true);
   }
 
   hideUsage() {
@@ -2638,7 +2799,7 @@ class ZacChatView {
     const d = st.data;
     const pop = this.usagePop;
     pop.replaceChildren();
-    const refresh = this.iconBtn("refresh", "刷新", () => this.p.refreshUsage(agent, true));
+    const refresh = this.iconBtn("refresh", "刷新", () => this.p.refreshUsage(agent, true, true));
     if (st.status === "loading") refresh.classList.add("zac-spin");
     pop.append(
       this.el(
@@ -2658,7 +2819,17 @@ class ZacChatView {
           { class: "zac-u-row " + zacUsageLevel(pct) },
           this.el("div", { class: "zac-u-line" }, this.el("span", { text: w.label }), this.el("span", { class: "zac-u-pct", text: `${Math.round(pct)}%` })),
           this.el("div", { class: "zac-u-bar" }, this.el("div", { class: "zac-u-fill", style: `width:${pct}%` })),
-          w.resetsAt ? this.el("div", { class: "zac-u-reset", text: zacFmtReset(w.resetsAt) }) : null
+          w.resetsAt ? this.el("div", { class: "zac-u-reset", text: zacFmtReset(w.resetsAt) }) : w.resetText ? this.el("div", { class: "zac-u-reset", text: w.resetText }) : null
+        )
+      );
+    }
+    if (d && d.raw) {
+      pop.append(
+        this.el(
+          "details",
+          { class: "zac-u-raw", open: d.windows && d.windows.length ? null : "" },
+          this.el("summary", { text: "agy /usage 原始输出" }),
+          this.el("pre", { text: zacClip(d.raw, 3000) })
         )
       );
     }
@@ -2671,7 +2842,12 @@ class ZacChatView {
     }
     if (st.ts) {
       const t = new Date(st.ts);
-      pop.append(this.el("div", { class: "zac-u-foot", text: `更新于 ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} · 每次回答后自动刷新` }));
+      pop.append(
+        this.el("div", {
+          class: "zac-u-foot",
+          text: `更新于 ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} · ` + (this.p.usageAuto(agent) ? "每次回答后自动刷新" : "点右上角刷新按钮更新"),
+        })
+      );
     }
   }
 
